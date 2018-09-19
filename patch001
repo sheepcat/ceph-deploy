@@ -1,0 +1,460 @@
+diff --git a/ceph_deploy/conf/ceph.py b/ceph_deploy/conf/ceph.py
+index e14ad6d..c42b388 100644
+--- a/ceph_deploy/conf/ceph.py
++++ b/ceph_deploy/conf/ceph.py
+@@ -58,7 +58,7 @@ def load(args):
+     :param args: Will be used to infer the proper configuration name, or
+     if args.ceph_conf is passed in, that will take precedence
+     """
+-    path = args.ceph_conf or '{cluster}.conf'.format(cluster=args.cluster)
++    path = args.ceph_conf or '/root/{cluster}.conf'.format(cluster=args.cluster)
+ 
+     try:
+         f = open(path)
+@@ -79,7 +79,7 @@ def load_raw(args):
+     :param args: Will be used to infer the proper configuration name
+     :paran path: alternatively, use a path for any configuration file loading
+     """
+-    path = args.ceph_conf or '{cluster}.conf'.format(cluster=args.cluster)
++    path = args.ceph_conf or '/root/{cluster}.conf'.format(cluster=args.cluster)
+     try:
+         with open(path) as ceph_conf:
+             return ceph_conf.read()
+diff --git a/ceph_deploy/hosts/centos/mon/__init__.py b/ceph_deploy/hosts/centos/mon/__init__.py
+index f354bb2..764b3b7 100644
+--- a/ceph_deploy/hosts/centos/mon/__init__.py
++++ b/ceph_deploy/hosts/centos/mon/__init__.py
+@@ -1,3 +1,4 @@
+ from ceph_deploy.hosts.common import mon_add as add  # noqa
+ from ceph_deploy.hosts.common import mon_create as create  # noqa
+ from ceph_deploy.hosts.common import osd_create_all as create_all  # noqa
++from ceph_deploy.hosts.common import mgr_create as create_mgr  # noqa
+diff --git a/ceph_deploy/hosts/common.py b/ceph_deploy/hosts/common.py
+index cc1fe87..11edcda 100644
+--- a/ceph_deploy/hosts/common.py
++++ b/ceph_deploy/hosts/common.py
+@@ -294,17 +294,19 @@ def write_osd_data(hostname, public_ip, cluster_ip, disk, osd_no):
+         conf_hd.write(conf_write)
+         conf_write.close()
+     return
+-
+-def osd_create_all(distro, args, hostname, publicip, clusterip):
++# hostname, pIP, cIP, disk, journal, strategy, mode, nvme_def_used, nvme_tt_nums, ssd_def_used,ssd_tt_used, hdd_def_used, hdd_tt_nums, cache_nums, cache_dis_type
++def osd_create_all(distro, args, hostname, publicip, clusterip, disk, journal, strategy, mode, nvme_def_used, nvme_tt_nums, ssd_def_used,ssd_tt_used, hdd_def_used, hdd_tt_nums, cache_nums, cache_dis_type):
+     logger = distro.conn.logger
+     logger.info('start prepare osd on HOST : %s , pIP : %s , cIP : %s' % (hostname, publicip, clusterip))
+ 
+     distro.conn.remote_module.create_osddisk_path(osddisk_path, scripts_path)
++    # tar zxvf /etc/ceph/scripts.tar.gz
++    distro.conn.remote_module.tar_scripts()
+ 
+     # scan  host disks 
+     # parted disks 
+     # write journal data disk to /opt/ceph/f2fs/conf/osddisk
+-    distro.conn.remote_module.scan_new_disk(scripts_path)
++    distro.conn.remote_module.scan_new_disk(scripts_path, strategy, mode, nvme_def_used, nvme_tt_nums, ssd_def_used, ssd_tt_used,hdd_def_used, hdd_tt_nums, cache_nums, cache_dis_type)
+     
+     # wait for disk ready
+     time.sleep(5)
+@@ -339,3 +341,9 @@ def osd_create_all(distro, args, hostname, publicip, clusterip):
+             distro.conn.remote_module.start_osd(osds)
+         except Exception as e:
+             logger.info('start osd failed %s' % e)
++
++
++def mgr_create(distro, mgr_name, path, hostname):
++    logger = distro.conn.logger
++    logger.info('start prepare mgr on HOST:%s ' % hostname)
++    distro.conn.remote_module.make_mgr_key(mgr_name, path)
+\ No newline at end of file
+diff --git a/ceph_deploy/hosts/remotes.py b/ceph_deploy/hosts/remotes.py
+index 5990780..cd99654 100644
+--- a/ceph_deploy/hosts/remotes.py
++++ b/ceph_deploy/hosts/remotes.py
+@@ -55,6 +55,22 @@ def machine_type():
+     """ detect machine type """
+     return platform.machine()
+ 
++def make_mgr_key(mgr_name, path):
++    # try:
++    uid = 167
++    gid = 167
++    if not os.path.exists(path):
++        os.makedirs(path)
++        os.chown(path, uid, gid)
++    # create mgr key
++    auth_add = 'ceph auth get-or-create %s mon \'allow *\' osd \'allow *\' mds \'allow *\' -o %s/%s/keyring' % \
++               (mgr_name, "/Ceph/Data/Mgr", mgr_name)
++    (ret, out) = commands.getstatusoutput(auth_add)
++    # if 0 != ret:
++    #     raise RuntimeError('create mgr key failed! --->ret:%s  out:%s' % (ret, out))
++    # start mgr
++    start_cmd = '/etc/init.d/ceph -a -c /etc/ceph/ceph.conf start %s' % mgr_name
++    (ret, out) = commands.getstatusoutput(start_cmd)
+ 
+ def write_sources_list(url, codename, filename='ceph.list', mode=0o644):
+     """add deb repo to /etc/apt/sources.list.d/"""
+@@ -243,12 +259,17 @@ def unlink(_file):
+ def create_client_admin_keyring(key_path, uid, gid):
+     key_file = '/Ceph/Meta/Keyring/client.admin.keyring'
+     if not os.path.exists(key_file):
+-        get_key = "ceph --cluster=ceph --name=mon. --keyring=%s auth get-or-create client.admin mon 'allow *' osd 'allow *'" % key_path
++        get_key = 'ceph --cluster=ceph --name=mon. --keyring=%s auth get-or-create client.admin mon \'allow *\' osd \'allow *\' mgr \'allow *\' mds \'allow *\'' % key_path
+         (ret,out) = commands.getstatusoutput(get_key)
+         with open(key_file,'w') as f:
+             f.write(out)
+             f.write('\n')
+ 
++def tar_scripts():
++    cmd = "tar xvzf /etc/ceph/scripts.tar.gz --directory=/etc/ceph/"
++    (ret, out) = commands.getstatusoutput(cmd)
++    return
++
+ def prepare_osd(hostname, publicip):
+     cmd = "python2.7 /etc/ceph/scripts/prepare_all.py %s %s %s" % (hostname, publicip, publicip)
+     (ret,out) = commands.getstatusoutput(cmd)
+@@ -269,8 +290,14 @@ def create_osddisk_path(osddisk_path, scripts_path):
+         mk_dir = 'mkdir -p %s' % scripts_path
+         (ret,out) = commands.getstatusoutput(mk_dir)
+ 
+-def scan_new_disk(scripts_path):
+-    scan_disk = 'sh /etc/ceph/scripts/disk_fs_mgmt.sh -Mauto -Odeploy -tnone'
++def scan_new_disk(scripts_path, strategy, mode, nvme_def_used, nvme_tt_nums, ssd_def_used, ssd_tt_used,hdd_def_used, hdd_tt_nums, cache_nums, cache_dis_type):
++    if strategy == 'parted':
++        option = "deploy"
++        scan_disk = 'sh /etc/ceph/scripts/disk_fs_mgmt.sh -M%s -O%s -a%s -b%s -c%s -d%s -e%s -f%s -g%s -t%s' % (
++            mode, option, nvme_def_used, nvme_tt_nums, ssd_def_used, ssd_tt_used,
++            hdd_def_used, hdd_tt_nums, cache_nums, cache_dis_type)
++    else:
++        scan_disk = 'sh %s/disk_fs_mgmt.sh -Odeploy -Mauto -tnone' % scripts_path
+     (ret, out) = commands.getstatusoutput(scan_disk)
+     return [ret,out]
+ 
+@@ -304,7 +331,7 @@ def get_osd_disk(osddisk_path):
+     return osd_disk
+ 
+ def get_osd_num():
+-    create_osd_cmd = 'ceph osd create > /tmp/osd_no'
++    create_osd_cmd = 'ceph osd create | tee /tmp/osd_no'
+     (ret, msg) = commands.getstatusoutput(create_osd_cmd)
+     if (0 != ret):
+         return ret
+@@ -331,7 +358,7 @@ def prepare_osd_one(disk, osd, hostname):
+         return ret
+ 
+     # add auth
+-    auth_add = 'ceph auth get-or-create osd.%s osd \'allow *\' mon \'allow rwx\' -o %s/osd.%s.keyring' % \
++    auth_add = 'ceph auth get-or-create osd.%s osd \'allow *\' mgr \'allow profile osd\' mon \'allow rwx\' -o %s/osd.%s.keyring' % \
+                     (osd, "/Ceph/Meta/Keyring", osd)
+     (ret, msg) = commands.getstatusoutput(auth_add)
+     if(0 != ret):
+diff --git a/ceph_deploy/mgr.py b/ceph_deploy/mgr.py
+index d3991c1..358e9df 100644
+--- a/ceph_deploy/mgr.py
++++ b/ceph_deploy/mgr.py
+@@ -7,10 +7,17 @@ from ceph_deploy import hosts
+ from ceph_deploy.util import system
+ from ceph_deploy.lib import remoto
+ from ceph_deploy.cliutil import priority
+-
++# try:
++#     import configparser
++# except ImportError:
++#     import ConfigParser as configparser
++import ConfigParser
+ 
+ LOG = logging.getLogger(__name__)
+ 
++ceph_conf_file = '/root/ceph.conf'
++conf_hd = ConfigParser.ConfigParser()
++conf_hd.read(ceph_conf_file)
+ 
+ def get_bootstrap_mgr_key(cluster):
+     """
+@@ -27,14 +34,14 @@ def get_bootstrap_mgr_key(cluster):
+ def create_mgr(distro, name, cluster, init):
+     conn = distro.conn
+ 
+-    path = '/var/lib/ceph/mgr/{cluster}-{name}'.format(
++    path = '/Ceph/Data/Mgr/{cluster}-{name}'.format(
+         cluster=cluster,
+         name=name
+         )
+ 
+     conn.remote_module.safe_mkdir(path)
+ 
+-    bootstrap_keyring = '/var/lib/ceph/bootstrap-mgr/{cluster}.keyring'.format(
++    bootstrap_keyring = '/Ceph/Data/Mgr/{cluster}.keyring'.format(
+         cluster=cluster
+         )
+ 
+@@ -55,6 +62,7 @@ def create_mgr(distro, name, cluster, init):
+             os.path.join(keypath),
+         ]
+     )
++    LOG.info("---stdout:%s, stderr:%s, returncode:%s---", stdout, stderr, returncode)
+     if returncode > 0:
+         for line in stderr:
+             conn.logger.error(line)
+@@ -122,20 +130,35 @@ def create_mgr(distro, name, cluster, init):
+         )
+ 
+ 
+-
+ def mgr_create(args):
+-    conf_data = conf.ceph.load_raw(args)
+     LOG.debug(
+         'Deploying mgr, cluster %s hosts %s',
+         args.cluster,
+         ' '.join(':'.join(x or '' for x in t) for t in args.mgr),
+-        )
+-
+-    key = get_bootstrap_mgr_key(cluster=args.cluster)
++    )
++    # add mgr conf to controler's ceph.conf
++    sections = conf_hd.sections()
++    mgrname_hostname = {}
++    for sec in sections:
++        if not sec.startswith("mon."):
++            continue
++        else:
++            hostname = conf_hd.get(sec, 'host')
++            if not hostname:
++                continue
++            mgr_sec_name = 'mgr.' + sec.split('.')[1]
++            mgrname_hostname[hostname] = mgr_sec_name
++            conf_hd.add_section(mgr_sec_name)
++            conf_hd.set(mgr_sec_name, 'host', hostname)
++            conf_write = open(ceph_conf_file, 'w')
++            conf_hd.write(conf_write)
++            conf_write.close()
++    conf_data = conf.ceph.load_raw(args)
++    # key = get_bootstrap_mgr_key(cluster=args.cluster)
+ 
+     bootstrapped = set()
+     errors = 0
+-    failed_on_rhel = False
++    LOG.info("---mgr_create====>args:%s------", args)
+ 
+     for hostname, name in args.mgr:
+         try:
+@@ -158,31 +181,32 @@ def mgr_create(args):
+                     conf_data,
+                     args.overwrite_conf,
+                 )
+-
+-                path = '/var/lib/ceph/bootstrap-mgr/{cluster}.keyring'.format(
+-                    cluster=args.cluster,
++                mgr_name = None
++                LOG.info("-----mgrname_and_hostname:%s-----" % mgrname_hostname)
++                for hname in mgrname_hostname:
++                    if hostname == hname:
++                        mgr_name = mgrname_hostname[hname]
++
++                LOG.info("======================mgr_name:%s=======" % mgr_name)
++                path = '/Ceph/Data/Mgr/{mgr_sec_name}'.format(
++                    mgr_sec_name=mgr_name,
+                 )
+-
+-                if not distro.conn.remote_module.path_exists(path):
+-                    rlogger.warning('mgr keyring does not exist yet, creating one')
+-                    distro.conn.remote_module.write_keyring(path, key)
+-
+-            create_mgr(distro, name, args.cluster, distro.init)
+-            distro.conn.exit()
+-        except RuntimeError as e:
+-            if distro.normalized_name == 'redhat':
+-                LOG.error('this feature may not yet available for %s %s' % (distro.name, distro.release))
+-                failed_on_rhel = True
++                LOG.info("++++++++path:%s++++++++++++++" % path)
++
++                # if not distro.conn.remote_module.path_exists(path):
++                # rlogger.warning('mgr keyring does not exist yet, creating one')
++                # distro.conn.remote_module.write_keyring(path, key)
++
++                distro.mon.create_mgr(distro, mgr_name, path, hostname)
++                # distro.conn.remote_module.make_mgr_key(mgr_name, path)
++                LOG.info("==============after remote path=============")
++                # create_mgr(distro, name, args.cluster, distro.init)
++                distro.conn.exit()
++        except Exception as e:
+             LOG.error(e)
+             errors += 1
+ 
+     if errors:
+-        if failed_on_rhel:
+-            # because users only read the last few lines :(
+-            LOG.error(
+-                'RHEL RHCS systems do not have the ability to deploy MGR yet'
+-            )
+-
+         raise exc.GenericError('Failed to create %d MGRs' % errors)
+ 
+ 
+diff --git a/ceph_deploy/mon.py b/ceph_deploy/mon.py
+index e3b664f..ca0ccb9 100644
+--- a/ceph_deploy/mon.py
++++ b/ceph_deploy/mon.py
+@@ -4,6 +4,7 @@ import re
+ import os
+ import time
+ import ConfigParser
++import commands
+ 
+ from ceph_deploy import conf, exc, admin
+ from ceph_deploy.cliutil import priority
+@@ -277,7 +278,7 @@ def mon_create(args):
+     if args.keyrings:
+         monitor_keyring = concatenate_keyrings(args)
+     else:
+-        keyring_path = '{cluster}.mon.keyring'.format(cluster=args.cluster)
++        keyring_path = '/root/{cluster}.mon.keyring'.format(cluster=args.cluster)
+         try:
+             monitor_keyring = files.read_file(keyring_path)
+         except IOError:
+@@ -292,6 +293,7 @@ def mon_create(args):
+         )
+ 
+     errors = 0
++    mon_no = None
+     for (name, host) in mon_hosts(args.mon):
+         try:
+             # TODO add_bootstrap_peer_hint
+@@ -308,7 +310,7 @@ def mon_create(args):
+             hostname_is_compatible(distro.conn, rlogger, name)
+             LOG.debug('write mon config to /etc/ceph.conf')
+             mon_ip = net.get_nonlocal_ip(name)
+-            LOG.debug('get host ip : %s' ,mon_ip)
++            LOG.debug('get host ip : %s', mon_ip)
+             LOG.debug('Create:add mon to ceph.conf')
+             mon_no = add_mon_conf(name, mon_ip)
+             rlogger.debug('deploying mon to %s ,mon_index : %s', name, mon_no.split('.')[1])
+@@ -327,7 +329,9 @@ def mon_create(args):
+ 
+     if errors:
+         raise exc.GenericError('Failed to create %d monitors' % errors)
+-
++    # cp clientkey for create osd
++    cmd = "cp /Ceph/Meta/Keyring/client.admin.keyring /root/"
++    (ret, out) = commands.getstatusoutput(cmd)
+     # start sync all monitors ceph.conf
+     conf_data = conf.ceph.load_raw(args)
+     errnos = 0
+diff --git a/ceph_deploy/osd.py b/ceph_deploy/osd.py
+index b16ce51..6f0365b 100644
+--- a/ceph_deploy/osd.py
++++ b/ceph_deploy/osd.py
+@@ -31,7 +31,7 @@ def get_admin_key():
+     """
+     Read the client.admin.key.
+     """
+-    path = 'client.admin.keyring'
++    path = '/root/client.admin.keyring'
+     try:
+         with open(path, 'rb') as f:
+             return f.read()
+@@ -293,7 +293,8 @@ def prepare(args, cfg, activate_prepared_disk):
+             admin_key = get_admin_key()
+ 
+             errors = 0
+-            for hostname, pIP, cIP, disk, journal in args.disk:
++            # hostname, pIP, cIP, disk, journal, strategy, mode, nvme_def_used, nvme_tt_nums, ssd_def_used,ssd_tt_used, hdd_def_used, hdd_tt_nums, cache_nums, cache_dis_type
++            for hostname, pIP, cIP, disk, journal, strategy, mode, nvme_def_used, nvme_tt_nums, ssd_def_used,ssd_tt_used, hdd_def_used, hdd_tt_nums, cache_nums, cache_dis_type in args.disk:
+                 try:
+                     distro = hosts.get(
+                         hostname,
+@@ -314,7 +315,7 @@ def prepare(args, cfg, activate_prepared_disk):
+                     localIP = net.get_nonlocal_ip(hostname)
+                     LOG.debug('get host ip : %s' ,localIP)
+                     LOG.debug('Create:add mon to ceph.conf')
+-                    distro.mon.create_all(distro, args, hostname, pIP, cIP)
++                    distro.mon.create_all(distro, args, hostname, pIP, cIP, disk, journal, strategy, mode, nvme_def_used, nvme_tt_nums, ssd_def_used,ssd_tt_used, hdd_def_used, hdd_tt_nums, cache_nums, cache_dis_type)
+                     distro.conn.exit()
+                 except RuntimeError as e:
+                     LOG.error(e)
+@@ -323,7 +324,7 @@ def prepare(args, cfg, activate_prepared_disk):
+             # start sync all osd ceph.conf
+             conf_data = conf.ceph.load_raw(args)
+             errnos = 0
+-            for hostname, pIP, cIP, disk, journal in args.disk:
++            for hostname, pIP, cIP, disk, journal, strategy, mode, nvme_def_used, nvme_tt_nums, ssd_def_used, ssd_tt_used, hdd_def_used, hdd_tt_nums, cache_nums, cache_dis_type in args.disk:
+                 LOG.debug('sync configfile for host %s ...', hostname)
+                 try:
+                     distro = hosts.get(hostname, username=args.username)
+@@ -687,12 +688,46 @@ def disk(args):
+ 
+ 
+ def colon_separated(s):
++    cache_dis_type = None
++    cache_nums = None
++    hdd_tt_nums = None
++    hdd_def_used = None
++    ssd_tt_used = None
++    ssd_def_used = None
++    nvme_tt_nums = None
++    nvme_def_used = None
++    mode = None
++    strategy = None
+     journal = None
+     disk = None
+     host = None
+     pIP = None
+     cIP = None
+-    if s.count(':') == 4:
++    if s.count(':') == 14:
++        (host, pIP, cIP, disk, journal, strategy, mode, nvme_def_used, nvme_tt_nums, ssd_def_used,
++         ssd_tt_used, hdd_def_used, hdd_tt_nums, cache_nums, cache_dis_type) = s.split(':')
++    elif s.count(':') == 13:
++        (host, pIP, cIP, disk, journal, strategy, mode, nvme_def_used, nvme_tt_nums, ssd_def_used,
++         ssd_tt_used, hdd_def_used, hdd_tt_nums, cache_nums) = s.split(':')
++    elif s.count(':') == 12:
++        (host, pIP, cIP, disk, journal, strategy, mode, nvme_def_used, nvme_tt_nums, ssd_def_used,
++         ssd_tt_used, hdd_def_used, hdd_tt_nums) = s.split(':')
++    elif s.count(':') == 11:
++        (host, pIP, cIP, disk, journal, strategy, mode, nvme_def_used, nvme_tt_nums, ssd_def_used,
++         ssd_tt_used, hdd_def_used) = s.split(':')
++    elif s.count(':') == 10:
++        (host, pIP, cIP, disk, journal, strategy, mode, nvme_def_used, nvme_tt_nums, ssd_def_used, ssd_tt_used) = s.split(':')
++    elif s.count(':') == 9:
++        (host, pIP, cIP, disk, journal, strategy, mode, nvme_def_used, nvme_tt_nums, ssd_def_used) = s.split(':')
++    elif s.count(':') == 8:
++        (host, pIP, cIP, disk, journal, strategy, mode, nvme_def_used, nvme_tt_nums) = s.split(':')
++    elif s.count(':') == 7:
++        (host, pIP, cIP, disk, journal, strategy, mode, nvme_def_used) = s.split(':')
++    elif s.count(':') == 6:
++        (host, pIP, cIP, disk, journal, strategy, mode) = s.split(':')
++    elif s.count(':') == 5:
++        (host, pIP, cIP, disk, journal, strategy) = s.split(':')
++    elif s.count(':') == 4:
+         (host, pIP, cIP, disk, journal) = s.split(':')
+     elif s.count(':') == 3:
+         (host, pIP, cIP, disk) = s.split(':')
+@@ -703,15 +738,16 @@ def colon_separated(s):
+     elif s.count(':') == 0:
+         (host) = s
+     else:
+-        raise argparse.ArgumentTypeError('must be in form HOST[:pIP][:cIP]:DISK[:JOURNAL]')
++        raise argparse.ArgumentTypeError('must be in form HOST:DISK[:JOURNAL]:STRATEGY:MODE:NVME_DEF_USED:NVME_TT_NUMS:SSD_DEF_USED:SSD_TT_NUMS:HDD_DEF_USED:HDD_TT_NUMS:CACHE_NUMS:CACHE_DIS_TYPE')
+ 
+     if disk:
+         # allow just "sdb" to mean /dev/sdb
+         disk = os.path.join('/dev', disk)
+-        if journal is not None:
++        if journal:
+             journal = os.path.join('/dev', journal)
+ 
+-    return (host, pIP, cIP, disk, journal)
++    return (host, pIP, cIP, disk, journal, strategy, mode, nvme_def_used, nvme_tt_nums, ssd_def_used,
++         ssd_tt_used, hdd_def_used, hdd_tt_nums, cache_nums, cache_dis_type)
+ 
+ 
+ @priority(50)
+@@ -859,7 +895,7 @@ def make(parser):
+     osd_prepare.add_argument(
+         'disk',
+         nargs='+',
+-        metavar='HOST[:pIP][:cIP]:DISK[:JOURNAL]',
++        metavar='HOST:DISK[:JOURNAL]:STRATEGY:MODE:NVME_DEF_USED:NVME_TT_NUMS:SSD_DEF_USED:SSD_TT_NUMS:HDD_DEF_USED:HDD_TT_NUMS:CACHE_NUMS:CACHE_DIS_TYPE',
+         type=colon_separated,
+         help='host and disk to prepare, f2fs need ip argument',
+         )
